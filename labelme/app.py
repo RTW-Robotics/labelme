@@ -12,6 +12,9 @@ from qtpy import QtCore
 from qtpy.QtCore import Qt
 from qtpy import QtGui
 from qtpy import QtWidgets
+from qtpy.QtCore import QTimer
+from qtpy.QtMultimedia import *
+from qtpy.QtMultimediaWidgets import *
 
 from labelme import __appname__
 from labelme import PY2
@@ -32,6 +35,7 @@ from labelme.widgets import ToolBar
 from labelme.widgets import UniqueLabelQListWidget
 from labelme.widgets import ZoomWidget
 
+import cv2 as cv
 
 # FIXME
 # - [medium] Set max zoom value to something big enough for FitWidth/Window
@@ -790,6 +794,27 @@ class MainWindow(QtWidgets.QMainWindow):
         # if self.firstStart:
         #    QWhatsThis.enterWhatsThisMode()
 
+        # RTW stuff goes here
+        # Create a timer.
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.nextFrameSlot)
+        self.camera = cv.VideoCapture(0)
+        self.camera.set(cv.CAP_PROP_FRAME_HEIGHT, 720)
+        self.camera.set(cv.CAP_PROP_FRAME_WIDTH, 1280)
+        self.timer.start()
+        self.imageCounter = 0
+        self.clearMarkupAfterSave = True
+
+
+
+    def nextFrameSlot(self):
+        rval, frame = self.camera.read()
+        frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+        image = QtGui.QImage(frame, frame.shape[1], frame.shape[0], QtGui.QImage.Format_RGB888)
+        self.loadImage(image)
+
+        return
+
     def menu(self, title, actions=None):
         menu = self.menuBar().addMenu(title)
         if actions:
@@ -1217,6 +1242,8 @@ class MainWindow(QtWidgets.QMainWindow):
             flags[key] = flag
         try:
             imagePath = osp.relpath(self.imagePath, osp.dirname(filename))
+
+
             imageData = self.imageData if self._config["store_data"] else None
             if osp.dirname(filename) and not osp.exists(osp.dirname(filename)):
                 os.makedirs(osp.dirname(filename))
@@ -1230,6 +1257,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 otherData=self.otherData,
                 flags=flags,
             )
+
+            # capture last image from the camera and store it
+            _, freshImage = self.camera.read()
+            cv.imwrite(self.imagePath, freshImage)
+            if self.clearMarkupAfterSave:
+                # dirty trick, need smth better
+                self.canvas.shapes = []
+                self.resetState()
+                self.canvas.resetState()
+
             self.labelFile = lf
             items = self.fileListWidget.findItems(
                 self.imagePath, Qt.MatchExactly
@@ -1240,6 +1277,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 items[0].setCheckState(Qt.Checked)
             # disable allows next and previous image to proceed
             # self.filename = filename
+            self.imageCounter += 1
             return True
         except LabelFileError as e:
             self.errorMessage(
@@ -1400,6 +1438,93 @@ class MainWindow(QtWidgets.QMainWindow):
     def togglePolygons(self, value):
         for item in self.labelList:
             item.setCheckState(Qt.Checked if value else Qt.Unchecked)
+
+    def loadImage(self, image, filename="camera_img"):
+
+        # create the virtual name of thw camera image to be captured
+        self.imagePath = os.path.join(self.output_dir, (filename + "_{:06d}.png").format(self.imageCounter))
+        self.labelFile = None
+        """Load the specified file, or the last opened file if None."""
+        # changing fileListWidget loads file
+
+        if image.isNull():
+            formats = [
+                "*.{}".format(fmt.data().decode())
+                for fmt in QtGui.QImageReader.supportedImageFormats()
+            ]
+            self.status(self.tr("Error reading %s"))
+            return False
+        self.image = image
+        self.filename = filename
+        if self._config["keep_prev"]:
+            prev_shapes = self.canvas.shapes
+        self.canvas.loadPixmap(QtGui.QPixmap.fromImage(image), clear_shapes=False)
+        self.canvas.setEnabled(True)
+
+        flags = {k: False for k in self._config["flags"] or []}
+        if self.labelFile:
+            self.loadLabels(self.labelFile.shapes)
+            if self.labelFile.flags is not None:
+                flags.update(self.labelFile.flags)
+        self.loadFlags(flags)
+        if self._config["keep_prev"] and self.noShapes():
+            self.loadShapes(prev_shapes, replace=False)
+            self.setDirty()
+        else:
+            self.setClean()
+        self.canvas.setEnabled(True)
+        # set zoom values
+        is_initial_load = not self.zoom_values
+        if self.filename in self.zoom_values:
+            self.zoomMode = self.zoom_values[self.filename][0]
+            self.setZoom(self.zoom_values[self.filename][1])
+        elif is_initial_load or not self._config["keep_prev_scale"]:
+            self.adjustScale(initial=True)
+        # set scroll values
+        for orientation in self.scroll_values:
+            if self.filename in self.scroll_values[orientation]:
+                self.setScroll(
+                    orientation, self.scroll_values[orientation][self.filename]
+                )
+        # set brightness constrast values
+        '''
+        dialog = BrightnessContrastDialog(
+            utils.img_data_to_pil(self.imageData),
+            self.onNewBrightnessContrast,
+            parent=self,
+        )
+        
+        brightness, contrast = self.brightnessContrast_values.get(
+            self.filename, (None, None)
+        )
+        if self._config["keep_prev_brightness"] and self.recentFiles:
+            brightness, _ = self.brightnessContrast_values.get(
+                self.recentFiles[0], (None, None)
+            )
+        if self._config["keep_prev_contrast"] and self.recentFiles:
+            _, contrast = self.brightnessContrast_values.get(
+                self.recentFiles[0], (None, None)
+            )
+        if brightness is not None:
+            dialog.slider_brightness.setValue(brightness)
+        if contrast is not None:
+            dialog.slider_contrast.setValue(contrast)
+        self.brightnessContrast_values[self.filename] = (brightness, contrast)
+        if brightness is not None or contrast is not None:
+            dialog.onNewValue(None)
+            
+        '''
+
+
+        self.paintCanvas()
+
+        self.toggleActions(True)
+        self.addRecentFile(self.filename)
+        self.status(self.tr("Loaded %s") % osp.basename(str(filename)))
+        return True
+
+
+
 
     def loadFile(self, filename=None):
         """Load the specified file, or the last opened file if None."""
